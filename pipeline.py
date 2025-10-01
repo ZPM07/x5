@@ -12,13 +12,11 @@ from typing import List, Dict, Any
 from ast import literal_eval
 
 from src.models.NER_classifier import NERClassifier
+from src.utils.rules import apply_priors
 from src.utils.paths import WEIGHTS_DIR
 
 DEVICE = "cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
 BASE_MODEL = "cointegrated/rubert-tiny2"
-VOLUME_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?(л|л\.|литр\w*|мл|ml|г|кг|шт|уп\w*|пак\w*|бут\w*)(?!\w)", re.IGNORECASE)
-PERCENT_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?%|процент\w*", re.IGNORECASE)
-
 
 def run_ner_pipeline(
     samples: List[Dict[str, Any]],
@@ -70,80 +68,86 @@ def run_ner_pipeline(
                 word_probs_1.append(float(np.max(curr_1)))
                 word_probs_2.append(float(np.max(curr_2)))
 
-            sample_result[f"{model_name}_proba_1"] = word_probs_1
-            sample_result[f"{model_name}_proba_2"] = word_probs_2
+            if model_name != 'o':
+                sample_result[f"{model_name}_proba_1"] = word_probs_1
+                sample_result[f"{model_name}_proba_2"] = word_probs_2
+            else:
+                sample_result[f"{model_name}_probs"] = word_probs_1
 
         all_results.append(sample_result)
 
     return pd.DataFrame(all_results)
-
-def rule_spans(text):
-    return [(m.start(), m.end(), "VOLUME") for m in VOLUME_RE.finditer(text)] + \
-           [(m.start(), m.end(), "PERCENT") for m in PERCENT_RE.finditer(text)]
-
-def apply_priors(text, words, probs, beta=2.0):
-    offsets, char_idx = [], 0
-    for w in words:
-        start, end = text.find(w, char_idx), text.find(w, char_idx) + len(w)
-        offsets.append((start, end))
-        char_idx = end + 1
-
-    for s, e, label in rule_spans(text):
-        for i, (w_start, w_end) in enumerate(offsets):
-            if max(s, w_start) < min(e, w_end):
-                if label == "VOLUME":
-                    probs[i][4] += beta
-                elif label == "PERCENT":
-                    probs[i][2] += beta
-    return probs
 
 def extract_features(row, words):
     n = len(words)
     features = []
     for i, word in enumerate(words):
         get_probs = lambda idx: [
-            row['brand_probs'][idx],
-            row['type_probs'][idx],
-            row['percent_probs'][idx],
-            row['volume_probs'][idx],
+            row['brand_proba_1'][idx],
+            row['brand_proba_2'][idx],
+            row['type_proba_1'][idx],
+            row['type_proba_2'][idx],
+            row['percent_proba_1'][idx],
+            row['percent_proba_2'][idx],
+            row['volume_proba_1'][idx],
+            row['volume_proba_2'][idx],
             row['o_probs'][idx],
-        ] if 0 <= idx < n else [0]*5
+        ] if 0 <= idx < n else [0]*9
 
-        feat = get_probs(i) + [i, len(word)] + get_probs(i-1) + [i > 0] + get_probs(i+1) + [i < n-1]
+        current = get_probs(i)
+        prev = get_probs(i-1)
+        next_ = get_probs(i+1)
+        has_prev = 1 if i > 0 else 0
+        has_next = 1 if i < n-1 else 0
+
+        feat = current + [i, len(word)] + prev + [has_prev] + next_ + [has_next]
         features.append(feat)
     return np.array(features, dtype=np.float32)
 
 def annotate_sample(text, words, labels):
-    annotations, prev_label, char_idx = [], None, 0
+    annotations = []
+    char_idx = 0
     for word, label in zip(words, labels):
-        start, end = text.find(word, char_idx), text.find(word, char_idx) + len(word)
-        bio = 'O' if label == 'O' else ('I-' + label if prev_label == label else 'B-' + label)
-        annotations.append((start, end, bio))
-        prev_label, char_idx = label, end + 1
+        start = text.find(word, char_idx)
+        end = start + len(word)
+        char_idx = end + 1
+        annotations.append((start, end, label))
     return annotations
 
 def infer_ensemble(models, df, le):
-    all_annots = []
+    all_annotations = []
     for _, row in df.iterrows():
-        text, words = row['sample'], row['sample'].split()
+        text = row['sample']
+        words = text.split()
+
         X = extract_features(row, words)
-        probs = np.mean([m.predict_proba(X) for m in models], axis=0)
-        probs = apply_priors(text, words, probs, beta=1.0)
-        labels = le.inverse_transform(probs.argmax(axis=1))
-        all_annots.append(annotate_sample(text, words, labels))
-    df['annotation'] = all_annots
+
+        all_probs = [model.predict_proba(X) for model in models]
+        mean_probs = np.mean(all_probs, axis=0)
+
+        mean_probs = apply_priors(text, words, mean_probs, beta=1.0)
+
+        pred_indices = mean_probs.argmax(axis=1)
+        pred_labels = [str(label) for label in le.inverse_transform(pred_indices)]
+
+        annotations = annotate_sample(text, words, pred_labels)
+        all_annotations.append(annotations)
+
+    df['annotation'] = all_annotations
     return df
 
-def run_boost_pipeline(df: pd.DataFrame) -> pd.DataFrame:
+def run_boost_pipeline(df, models_dir):
+
     for col in df.columns:
         if col != 'sample':
             df[col] = df[col].apply(lambda x: literal_eval(x) if isinstance(x, str) else x)
 
-    xgboost_folder = os.path.join(WEIGHTS_DIR, "xgboost")
-    models = [joblib.load(os.path.join(xgboost_folder, f"xgb_fold{fold}.joblib")) for fold in range(1, 6)]
-    le = joblib.load(os.path.join(xgboost_folder, "label_encoder.joblib"))
+    models_dir = os.path.join(WEIGHTS_DIR, "xgboost")
+    models = [joblib.load(os.path.join(models_dir, f"xgb_fold{fold}.joblib")) for fold in range(1, 6)]
+    le = joblib.load(os.path.join(models_dir, "label_encoder.joblib"))
 
-    return infer_ensemble(models, df, le)
+    df = infer_ensemble(models, df, le)
+    return df
 
 def initialize_models():
 
@@ -179,14 +183,19 @@ def initialize_models():
 
     return models, tokenizer
 
-
-if __name__ == "__main__":
-    df = pd.read_csv("data/raw/test.csv", delimiter=";")
+def process_example(df: pd.DataFrame):
 
     samples = [{"text": row["sample"]} for _, row in df.iterrows()]
     models, tokenizer = initialize_models()
 
     ner_output = run_ner_pipeline(samples=samples, models=models, tokenizer=tokenizer)
+    submit = run_boost_pipeline(ner_output, models_dir=WEIGHTS_DIR)
 
-    submit = run_boost_pipeline(ner_output)
-    submit[['sample', 'annotation']].to_csv("xgboost_test_ensemble.csv", sep=";", index=False)
+    return submit
+
+if __name__ == "__main__":
+
+    df = pd.read_csv("data/raw/test.csv", delimiter=";")
+    submit = process_example(df)
+
+    submit[['sample', 'annotation']].to_csv("data/processed/xgboost_test_ensemble.csv", sep=";", index=False)
