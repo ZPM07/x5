@@ -1,46 +1,32 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer
 
 import os
 import re
 import joblib
 import numpy as np
 import pandas as pd
+from typing import List, Dict, Any
 
 from ast import literal_eval
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from src.models.NER_classifier import NERClassifier
+from src.utils.paths import WEIGHTS_DIR
 
-# ========================
-# Общий классификатор
-# ========================
-class NERClassifier(nn.Module):
-    def __init__(self, base_model_name, num_labels=3):
-        super().__init__()
-        self.base = AutoModel.from_pretrained(base_model_name)
-        hidden = self.base.config.hidden_size
-        self.dropout = nn.Dropout(0.1)
-        self.cls = nn.Linear(hidden, num_labels)
+DEVICE = "cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
+BASE_MODEL = "cointegrated/rubert-tiny2"
+VOLUME_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?(л|л\.|литр\w*|мл|ml|г|кг|шт|уп\w*|пак\w*|бут\w*)(?!\w)", re.IGNORECASE)
+PERCENT_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?%|процент\w*", re.IGNORECASE)
 
-    def forward(self, input_ids, attention_mask):
-        out = self.base(input_ids=input_ids, attention_mask=attention_mask)
-        x = self.dropout(out.last_hidden_state)
-        logits = self.cls(x)
-        return logits
 
-# ========================
-# Универсальная функция инференса
-# ========================
-def infer_ner_model(samples, model_dir, model_name, base_model="cointegrated/rubert-tiny2", max_len=64):
-    # Загрузка токенизатора и модели
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = NERClassifier(base_model).to(DEVICE)
-    model.load_state_dict(torch.load(os.path.join(model_dir, f"{model_name}.pt"), map_location=DEVICE))
-    model.eval()
-
-    results = []
+def run_ner_pipeline(
+    samples: List[Dict[str, Any]],
+    models: Dict[str, torch.nn.Module],
+    tokenizer,
+    max_len: int = 64
+) -> pd.DataFrame:
+    all_results = []
 
     for item in samples:
         text = item["text"]
@@ -55,41 +41,41 @@ def infer_ner_model(samples, model_dir, model_name, base_model="cointegrated/rub
             max_length=max_len
         ).to(DEVICE)
 
-        with torch.no_grad():
-            logits = model(encoding["input_ids"], encoding["attention_mask"])
-            probs = F.softmax(logits, dim=-1)
+        sample_result = {"sample": text}
 
-        word_ids = encoding.word_ids(batch_index=0)
-        current_word = None
-        curr_1, curr_2 = [], []
-        word_probs_1, word_probs_2 = [], []
+        for model_name, model in models.items():
+            with torch.no_grad():
+                logits = model(encoding["input_ids"], encoding["attention_mask"])
+                probs = F.softmax(logits, dim=-1)
 
-        for w_id, p in zip(word_ids, probs.squeeze().cpu().numpy()):
-            if w_id is None:
-                continue
-            if w_id != current_word:
-                if current_word is not None:
-                    word_probs_1.append(float(np.max(curr_1)))
-                    word_probs_2.append(float(np.max(curr_2)))
-                current_word = w_id
-                curr_1, curr_2 = [p[1]], [p[2]]
-            else:
-                curr_1.append(p[1])
-                curr_2.append(p[2])
+            word_ids = encoding.word_ids(batch_index=0)
+            current_word = None
+            curr_1, curr_2 = [], []
+            word_probs_1, word_probs_2 = [], []
 
-        if curr_1:
-            word_probs_1.append(float(np.max(curr_1)))
-            word_probs_2.append(float(np.max(curr_2)))
+            for w_id, p in zip(word_ids, probs.squeeze().cpu().numpy()):
+                if w_id is None:
+                    continue
+                if w_id != current_word:
+                    if current_word is not None:
+                        word_probs_1.append(float(np.max(curr_1)))
+                        word_probs_2.append(float(np.max(curr_2)))
+                    current_word = w_id
+                    curr_1, curr_2 = [p[1]], [p[2] if len(p) > 2 else 0.0]
+                else:
+                    curr_1.append(p[1])
+                    curr_2.append(p[2] if len(p) > 2 else 0.0)
 
-        results.append({
-            f"{model_name}_proba_1": word_probs_1,
-            f"{model_name}_proba_2": word_probs_2,
-        })
+            if curr_1:
+                word_probs_1.append(float(np.max(curr_1)))
+                word_probs_2.append(float(np.max(curr_2)))
 
-    return results
+            sample_result[f"{model_name}_proba_1"] = word_probs_1
+            sample_result[f"{model_name}_proba_2"] = word_probs_2
 
-VOLUME_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?(л|л\.|литр\w*|мл|ml|г|кг|шт|уп\w*|пак\w*|бут\w*)(?!\w)", re.IGNORECASE)
-PERCENT_RE = re.compile(r"(?<!\w)(\d+[.,]?\d*)\s?%|процент\w*", re.IGNORECASE)
+        all_results.append(sample_result)
+
+    return pd.DataFrame(all_results)
 
 def rule_spans(text):
     return [(m.start(), m.end(), "VOLUME") for m in VOLUME_RE.finditer(text)] + \
@@ -148,30 +134,59 @@ def infer_ensemble(models, df, le):
     df['annotation'] = all_annots
     return df
 
-def predict(df: pd.DataFrame) -> pd.DataFrame:
+def run_boost_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         if col != 'sample':
-            df[col] = df[col].apply(literal_eval)
+            df[col] = df[col].apply(lambda x: literal_eval(x) if isinstance(x, str) else x)
 
-    models = [joblib.load(f"xgb/xgb_fold{fold}.joblib") for fold in range(1, 6)]
-    le = joblib.load("xgb/label_encoder.joblib")
+    xgboost_folder = os.path.join(WEIGHTS_DIR, "xgboost")
+    models = [joblib.load(os.path.join(xgboost_folder, f"xgb_fold{fold}.joblib")) for fold in range(1, 6)]
+    le = joblib.load(os.path.join(xgboost_folder, "label_encoder.joblib"))
 
     return infer_ensemble(models, df, le)
 
-df = pd.read_csv("submission.csv")
-samples = [{"text": row["sample"]} for _, row in df.iterrows()]
+def initialize_models():
 
-model_names = ["brand", "type", "percent", "volume", "O"]
-all_outputs = []
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 
-for name in model_names:
-    model_dir = f"models/{name}" 
-    model_file = f"{name}_model"
-    out = infer_ner_model(samples, model_dir, model_name=name)
-    all_outputs.append(pd.DataFrame(out))
+    models = {
+        "brand": NERClassifier(base_model_name=BASE_MODEL, num_labels=3, use_dropout=False),
+        "type": NERClassifier(base_model_name=BASE_MODEL, num_labels=3, use_dropout=True),
+        "volume": NERClassifier(base_model_name=BASE_MODEL, num_labels=3, use_dropout=False),
+        "percent": NERClassifier(base_model_name=BASE_MODEL, num_labels=3, use_dropout=False),
+        "o": NERClassifier(base_model_name=BASE_MODEL, num_labels=2, use_dropout=False),
+    }
 
-for df_out in all_outputs:
-    df = pd.concat([df, df_out], axis=1)
+    for name, model in models.items():
+        model_path = os.path.join(WEIGHTS_DIR, name, "model.pt")
 
-result = predict(df)
-result[['sample', 'annotation']].to_csv("xgboost_test_ensemble.csv", sep=";", index=False)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+        state_dict = torch.load(model_path, map_location=DEVICE)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k
+            if new_k.startswith("base."):
+                new_k = new_k.replace("base.", "base_model.")
+            if new_k.startswith("cls."):
+                new_k = new_k.replace("cls.", "classifier.")
+            new_state_dict[new_k] = v
+
+        model.load_state_dict(new_state_dict)
+        model.to(DEVICE)
+        model.eval()
+
+    return models, tokenizer
+
+
+if __name__ == "__main__":
+    df = pd.read_csv("data/raw/test.csv", delimiter=";")
+
+    samples = [{"text": row["sample"]} for _, row in df.iterrows()]
+    models, tokenizer = initialize_models()
+
+    ner_output = run_ner_pipeline(samples=samples, models=models, tokenizer=tokenizer)
+
+    submit = run_boost_pipeline(ner_output)
+    submit[['sample', 'annotation']].to_csv("xgboost_test_ensemble.csv", sep=";", index=False)
