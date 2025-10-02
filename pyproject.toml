@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "x5"
 version = "0.1.0"
@@ -17,3 +21,6 @@ dependencies = [
     "xgboost>=3.0.5",
     "torch>=2.8.0"
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]

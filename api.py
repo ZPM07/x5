@@ -1,36 +1,38 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
-import pandas as pd
+from typing import List, Dict, Any
 
-from pipeline import process_example
+from predictor import Predictor
 
 app = FastAPI(
     title="NER Inference API",
-    description="API для аннотации сущностей через RuBERT + XGBoost",
+    description="API для аннотации сущностей с помощью NER",
     version="1.0.0"
 )
 
-class TextRequest(BaseModel):
-    texts: List[str]
+predictor = Predictor()
 
-@app.post("/predict")
-def predict(request: TextRequest):
-    if not request.texts:
-        raise HTTPException(status_code=400, detail="Список текстов пуст.")
+
+class PredictRequest(BaseModel):
+    input: str
+
+
+@app.post("/api/predict")
+def predict(request: PredictRequest) -> List[Dict[str, Any]]:
+    text = request.input.strip()
+
+    if not text:
+        return []
 
     try:
-        df = pd.DataFrame({"sample": request.texts})
-        result_df = process_example(df)
+        annotations = predictor.predict(text)
 
-        return {
-            "results": [
-                {
-                    "text": row["sample"],
-                    "annotations": row["annotation"]
-                } for _, row in result_df.iterrows()
-            ]
-        }
+        result = [
+            {"start": start, "end": end, "label": label}
+            for (start, end, label) in annotations
+        ]
+
+        return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
