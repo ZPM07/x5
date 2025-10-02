@@ -12,6 +12,25 @@
 
 ## 🚀 Быстрый старт
 
+### 🐳 Запуск с помощью Docker
+
+Проект поддерживает запуск через Docker. Убедитесь, что у вас установлен [Docker](https://docs.docker.com/get-docker/) и [Docker Compose](https://docs.docker.com/compose/install/).
+
+**Запуск с помощью Docker:**
+
+```bash
+# Сборка
+docker build -f docker/Dockerfile -t x5 .
+# Запуск контейнера:
+docker run -it --rm -p 8000:8000 x5
+```
+
+**Запуск с помощью Docker Compose:**
+
+```bash
+docker-compose up --build
+```
+
 ### 📦 Установка
 
 Проект использует [**uv**](https://github.com/astral-sh/uv) для управления зависимостями.
