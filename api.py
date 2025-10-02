@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
 
-from predictor import Predictor
+from src.predictor import Predictor
 
 app = FastAPI(
     title="NER Inference API",

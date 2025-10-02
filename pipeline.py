@@ -1,7 +1,7 @@
 import pandas as pd
 import os
 from predictor import Predictor
-from utils.paths import RAW_DATA_DIR, PROCESSED_DATA_DIR
+from src.utils.paths import RAW_DATA_DIR, PROCESSED_DATA_DIR
 
 def main():
 
