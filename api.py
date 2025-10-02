@@ -28,7 +28,7 @@ def predict(request: PredictRequest) -> List[Dict[str, Any]]:
         annotations = predictor.predict(text)
 
         result = [
-            {"start": start, "end": end, "label": label}
+            {"start_index": start, "end_index": end, "entity": label}
             for (start, end, label) in annotations
         ]
 
