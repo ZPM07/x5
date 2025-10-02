@@ -19,7 +19,8 @@ dependencies = [
     "transformers>=4.56.2",
     "uvicorn>=0.37.0",
     "xgboost>=3.0.5",
-    "torch>=2.8.0"
+    "torch>=2.8.0",
+    "sentence-transformers>=5.1.1",
 ]
 
 [tool.setuptools.packages.find]
