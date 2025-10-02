@@ -31,6 +31,11 @@ docker run -it --rm -p 8000:8000 x5
 docker-compose up --build
 ```
 
+## Docker Hub
+
+🔗 [https://hub.docker.com/r/zpm07/x5](https://hub.docker.com/r/zpm07/x5)  
+📦 `docker pull zpm07/x5`
+
 ### 📦 Установка
 
 Проект использует [**uv**](https://github.com/astral-sh/uv) для управления зависимостями.
@@ -63,7 +68,7 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
 После запуска сервис будет доступен по адресу:
-🔗 http://localhost:8000
+🔗 [http://localhost:8000](http://localhost:8000)
 
 ### Пример запроса:
 ``` bash
